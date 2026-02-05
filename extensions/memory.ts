@@ -261,7 +261,15 @@ async function queryLightRAG(params: {
  * Filter chunks by relevance score.
  */
 function filterByRelevance(chunks: LightRAGChunk[], minScore: number): LightRAGChunk[] {
-  return chunks.filter(chunk => (chunk.score ?? 0.5) >= minScore);
+  // LightRAG doesn't return scores in the response, so we skip filtering if scores are missing
+  // If score is present, use it; otherwise treat as 1.0 (passed from backend as relevant)
+  return chunks.filter(chunk => {
+    const score = chunk.score;
+    if (score === undefined || score === null) {
+      return true; // Keep chunks without scores (LightRAG already filtered them)
+    }
+    return score >= minScore;
+  });
 }
 
 /**
