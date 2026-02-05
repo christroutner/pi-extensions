@@ -472,7 +472,6 @@ export default function (pi: ExtensionAPI) {
         summaryStyle = "snippet",
         requirePattern,
         diverseSources = true,
-        timeout,
       } = params as {
         query: string;
         count?: number;
@@ -509,7 +508,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const searchCount = Math.max(1, Math.min(MAX_SEARCH_COUNT, Math.floor(count ?? DEFAULT_SEARCH_COUNT)));
-      const timeout = Math.min(MAX_TIMEOUT, Math.max(5, params.timeout ?? DEFAULT_TIMEOUT));
+      const timeout = Math.min(MAX_TIMEOUT, Math.max(5, (params as { timeout?: number }).timeout ?? DEFAULT_TIMEOUT));
 
       // Stream progress update
       onUpdate?.({
