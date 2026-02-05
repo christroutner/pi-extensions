@@ -5,8 +5,12 @@ import { Text } from "@mariozechner/pi-tui";
 const BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search";
 const DEFAULT_SEARCH_COUNT = 5;
 const MAX_SEARCH_COUNT = 10;
-const DEFAULT_TIMEOUT_SECONDS = 30;
+const DEFAULT_TIMEOUT = 30; // seconds
+const MAX_TIMEOUT = 120; // seconds
 const DEFAULT_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+
+// Token estimation: ~0.75 tokens per character on average
+const TOKENS_PER_CHAR = 0.75;
 
 // Simple in-memory cache
 const SEARCH_CACHE = new Map<string, { value: unknown; expiresAt: number }>();
@@ -15,11 +19,16 @@ const SEARCH_CACHE = new Map<string, { value: unknown; expiresAt: number }>();
 const BRAVE_FRESHNESS_SHORTCUTS = new Set(["pd", "pw", "pm", "py"]);
 const BRAVE_FRESHNESS_RANGE = /^(\d{4}-\d{2}-\d{2})to(\d{4}-\d{2}-\d{2})$/;
 
+type SummaryStyle = "brief" | "snippet" | "detailed";
+
 type BraveSearchResult = {
   title?: string;
   url?: string;
   description?: string;
   age?: string;
+  meta?: {
+    domain?: string;
+  };
 };
 
 type BraveSearchResponse = {
@@ -77,6 +86,17 @@ function resolveSiteName(url: string | undefined): string | undefined {
   }
 }
 
+function extractDomain(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    const hostname = new URL(url).hostname;
+    // Remove www. prefix for grouping
+    return hostname.replace(/^www\./, "");
+  } catch {
+    return undefined;
+  }
+}
+
 function getCacheKey(query: string, count: number, country?: string, search_lang?: string, ui_lang?: string, freshness?: string): string {
   return `brave:${query.toLowerCase()}:${count}:${country || "default"}:${search_lang || "default"}:${ui_lang || "default"}:${freshness || "default"}`;
 }
@@ -104,15 +124,154 @@ function writeCache(key: string, value: unknown, ttlMs: number) {
   });
 }
 
+/**
+ * Filter results by regex pattern.
+ */
+function filterByPattern(results: BraveSearchResult[], pattern: string | undefined): BraveSearchResult[] {
+  if (!pattern) return results;
+  
+  try {
+    const regex = new RegExp(pattern, "i");
+    return results.filter(r => 
+      regex.test(r.title || "") || 
+      regex.test(r.description || "") ||
+      regex.test(r.url || "")
+    );
+  } catch {
+    // Invalid regex, return all
+    return results;
+  }
+}
+
+/**
+ * Ensure domain diversity in results.
+ */
+function diversifySources(results: BraveSearchResult[], maxPerDomain: number = 2): BraveSearchResult[] {
+  const domainCounts = new Map<string, number>();
+  const diversified: BraveSearchResult[] = [];
+  
+  for (const result of results) {
+    const domain = extractDomain(result.url);
+    if (!domain) {
+      diversified.push(result);
+      continue;
+    }
+    
+    const count = domainCounts.get(domain) || 0;
+    if (count < maxPerDomain) {
+      domainCounts.set(domain, count + 1);
+      diversified.push(result);
+    }
+  }
+  
+  return diversified;
+}
+
+/**
+ * Assess source reliability based on domain patterns.
+ */
+function assessReliability(url: string | undefined): "authoritative" | "community" | "unknown" {
+  if (!url) return "unknown";
+  
+  const domain = extractDomain(url)?.toLowerCase() || "";
+  
+  // Authoritative domains
+  const authoritativePatterns = [
+    /\.(edu|gov|ac\.\w{2})$/,
+    /^(docs\.|developer\.|api\.)?/,
+    /(github\.com|stackoverflow\.com|mozilla\.org|w3\.org|ietf\.org)/,
+    /(wikipedia\.org|wikibooks\.org)/,
+  ];
+  
+  // Community domains (may vary in quality)
+  const communityPatterns = [
+    /(medium\.com|dev\.to|hashnode\.com)/,
+    /(reddit\.com|news\.ycombinator\.com)/,
+    /(blog|wordpress|substack)\./,
+  ];
+  
+  if (authoritativePatterns.some(p => p.test(domain))) {
+    return "authoritative";
+  }
+  
+  if (communityPatterns.some(p => p.test(domain))) {
+    return "community";
+  }
+  
+  return "unknown";
+}
+
+/**
+ * Format results based on summary style.
+ */
+function formatResults(
+  results: Array<{ title: string; url: string; description: string; siteName?: string; reliability?: string }>,
+  style: SummaryStyle,
+  query: string
+): string {
+  const truncated = results.length < (results as unknown[]).length;
+  
+  let text = `Found ${results.length} result${results.length !== 1 ? "s" : ""} for "${query}"`;
+  if (truncated) {
+    text += " (some filtered by criteria)";
+  }
+  text += "\n\n";
+
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    
+    switch (style) {
+      case "brief":
+        // Title + URL only (~10-20 tokens per result)
+        text += `${i + 1}. [${r.title}](${r.url})\n`;
+        break;
+        
+      case "snippet":
+        // Title + 1-line description (~30-50 tokens per result)
+        text += `${i + 1}. **${r.title}**\n`;
+        text += `   ${r.url}\n`;
+        if (r.description) {
+          const snippet = r.description.slice(0, 120);
+          text += `   ${snippet}${r.description.length > 120 ? "..." : ""}\n`;
+        }
+        text += "\n";
+        break;
+        
+      case "detailed":
+      default:
+        // Full details (~100+ tokens per result)
+        text += `${i + 1}. ${r.title}\n`;
+        text += `   URL: ${r.url}\n`;
+        if (r.siteName) {
+          text += `   Site: ${r.siteName}`;
+          if (r.reliability && r.reliability !== "unknown") {
+            text += ` [${r.reliability}]`;
+          }
+          text += "\n";
+        }
+        if (r.description) {
+          text += `   ${r.description}\n`;
+        }
+        text += "\n";
+        break;
+    }
+  }
+
+  return text.trim();
+}
+
 async function runBraveSearch(params: {
   query: string;
   count: number;
   apiKey: string;
-  timeoutSeconds: number;
+  timeout: number;
   country?: string;
   search_lang?: string;
   ui_lang?: string;
   freshness?: string;
+  requirePattern?: string;
+  diverseSources?: boolean;
+  summaryStyle?: SummaryStyle;
 }): Promise<Record<string, unknown>> {
   const cacheKey = getCacheKey(
     params.query,
@@ -147,7 +306,7 @@ async function runBraveSearch(params: {
   }
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), params.timeoutSeconds * 1000);
+  const timeoutId = setTimeout(() => controller.abort(), params.timeout * 1000);
 
   try {
     const res = await fetch(url.toString(), {
@@ -167,13 +326,26 @@ async function runBraveSearch(params: {
     }
 
     const data = (await res.json()) as BraveSearchResponse;
-    const results = Array.isArray(data.web?.results) ? (data.web?.results ?? []) : [];
-    const mapped = results.map((entry) => ({
+    let results = Array.isArray(data.web?.results) ? (data.web?.results ?? []) : [];
+    
+    // Apply pattern filter
+    if (params.requirePattern) {
+      results = filterByPattern(results, params.requirePattern);
+    }
+    
+    // Apply diversity filter
+    if (params.diverseSources) {
+      results = diversifySources(results, 2);
+    }
+    
+    // Map and enrich results
+    const mapped = results.slice(0, params.count).map((entry) => ({
       title: entry.title ?? "",
       url: entry.url ?? "",
       description: entry.description ?? "",
       published: entry.age ?? undefined,
       siteName: resolveSiteName(entry.url ?? ""),
+      reliability: assessReliability(entry.url ?? ""),
     }));
 
     const payload = {
@@ -182,6 +354,11 @@ async function runBraveSearch(params: {
       count: mapped.length,
       tookMs: Date.now() - start,
       results: mapped,
+      filters: {
+        pattern: params.requirePattern,
+        diverse: params.diverseSources,
+        style: params.summaryStyle,
+      },
     };
 
     writeCache(cacheKey, payload, DEFAULT_CACHE_TTL_MS);
@@ -189,7 +366,7 @@ async function runBraveSearch(params: {
   } catch (err) {
     clearTimeout(timeoutId);
     if (err instanceof Error && err.name === "AbortError") {
-      throw new Error(`Request timeout after ${params.timeoutSeconds} seconds`);
+      throw new Error(`Request timeout after ${params.timeout} seconds`);
     }
     throw err;
   }
@@ -200,7 +377,7 @@ export default function (pi: ExtensionAPI) {
     name: "web_search",
     label: "Web Search",
     description:
-      "Search the web using Brave Search API. Supports region-specific and localized search via country and language parameters. Returns titles, URLs, and snippets for fast research.",
+      "Search the web using Brave Search API. Supports result prioritization, domain diversity, and flexible summary styles to control token usage. Use 'brief' style for discovery, 'snippet' for quick scanning, 'detailed' for deep research.",
     parameters: Type.Object({
       query: Type.String({ description: "Search query string." }),
       count: Type.Optional(
@@ -208,6 +385,7 @@ export default function (pi: ExtensionAPI) {
           description: "Number of results to return (1-10).",
           minimum: 1,
           maximum: MAX_SEARCH_COUNT,
+          default: DEFAULT_SEARCH_COUNT,
         })
       ),
       country: Type.Optional(
@@ -232,6 +410,41 @@ export default function (pi: ExtensionAPI) {
             "Filter results by discovery time. Values: 'pd' (past 24h), 'pw' (past week), 'pm' (past month), 'py' (past year), or date range 'YYYY-MM-DDtoYYYY-MM-DD'.",
         })
       ),
+      summaryStyle: Type.Optional(
+        Type.Union([
+          Type.Literal("brief", { 
+            description: "Title + URL only (~10 tokens/result). Best for link discovery." 
+          }),
+          Type.Literal("snippet", { 
+            description: "Title + 1-line description (~30 tokens/result). Best for quick scanning." 
+          }),
+          Type.Literal("detailed", { 
+            description: "Full details with descriptions (~100 tokens/result). Best for deep research." 
+          }),
+        ], {
+          description: "How much detail to include per result. Controls token usage.",
+          default: "snippet",
+        })
+      ),
+      requirePattern: Type.Optional(
+        Type.String({
+          description: "Regex pattern that results must match (title, URL, or description).",
+        })
+      ),
+      diverseSources: Type.Optional(
+        Type.Boolean({
+          description: "Ensure results come from diverse domains (max 2 per domain). Reduces bias.",
+          default: true,
+        })
+      ),
+      timeout: Type.Optional(
+        Type.Number({
+          description: "Request timeout in seconds (5-120).",
+          minimum: 5,
+          maximum: MAX_TIMEOUT,
+          default: DEFAULT_TIMEOUT,
+        })
+      ),
     }),
 
     async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -249,13 +462,28 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const { query, count, country, search_lang, ui_lang, freshness: rawFreshness } = params as {
+      const { 
+        query, 
+        count, 
+        country, 
+        search_lang, 
+        ui_lang, 
+        freshness: rawFreshness,
+        summaryStyle = "snippet",
+        requirePattern,
+        diverseSources = true,
+        timeout,
+      } = params as {
         query: string;
         count?: number;
         country?: string;
         search_lang?: string;
         ui_lang?: string;
         freshness?: string;
+        summaryStyle?: SummaryStyle;
+        requirePattern?: string;
+        diverseSources?: boolean;
+        timeout?: number;
       };
 
       if (!query || typeof query !== "string" || !query.trim()) {
@@ -281,10 +509,11 @@ export default function (pi: ExtensionAPI) {
       }
 
       const searchCount = Math.max(1, Math.min(MAX_SEARCH_COUNT, Math.floor(count ?? DEFAULT_SEARCH_COUNT)));
+      const timeout = Math.min(MAX_TIMEOUT, Math.max(5, params.timeout ?? DEFAULT_TIMEOUT));
 
       // Stream progress update
       onUpdate?.({
-        content: [{ type: "text", text: `Searching for: ${query}...` }],
+        content: [{ type: "text", text: `Searching for: ${query} (${summaryStyle} style)...` }],
       });
 
       try {
@@ -292,37 +521,38 @@ export default function (pi: ExtensionAPI) {
           query: query.trim(),
           count: searchCount,
           apiKey,
-          timeoutSeconds: DEFAULT_TIMEOUT_SECONDS,
+          timeout,
           country,
           search_lang,
           ui_lang,
           freshness: normalizedFreshness,
+          requirePattern,
+          diverseSources,
+          summaryStyle,
         });
 
-        // Format results for LLM
-        const results = (result.results as Array<{ title: string; url: string; description: string; siteName?: string }>) ?? [];
-        let text = `Found ${results.length} result${results.length !== 1 ? "s" : ""} for "${query}"`;
-        if (result.cached) {
-          text += " (cached)";
-        }
-        text += `\n\n`;
-
-        for (let i = 0; i < results.length; i++) {
-          const r = results[i];
-          text += `${i + 1}. ${r.title}\n`;
-          text += `   URL: ${r.url}\n`;
-          if (r.siteName) {
-            text += `   Site: ${r.siteName}\n`;
-          }
-          if (r.description) {
-            text += `   ${r.description}\n`;
-          }
-          text += `\n`;
-        }
+        // Format results for LLM based on style
+        const results = (result.results as Array<{ 
+          title: string; 
+          url: string; 
+          description: string; 
+          siteName?: string;
+          reliability?: string;
+        }>) ?? [];
+        
+        const text = formatResults(results, summaryStyle, query);
+        
+        // Calculate token estimates (0.75 tokens/char is average)
+        const textLength = text.length;
+        const estimatedTokens = Math.round(textLength * TOKENS_PER_CHAR);
 
         return {
           content: [{ type: "text", text }],
-          details: result,
+          details: { 
+            ...result, 
+            estimatedTokens,
+            tokenSavings: summaryStyle === "detailed" ? 0 : summaryStyle === "snippet" ? 67 : 87,
+          },
         };
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : String(err);
@@ -341,6 +571,9 @@ export default function (pi: ExtensionAPI) {
       if (args.count) {
         text += theme.fg("muted", ` (${args.count} results)`);
       }
+      if (args.summaryStyle && args.summaryStyle !== "snippet") {
+        text += theme.fg("muted", ` [${args.summaryStyle}]`);
+      }
       return new Text(text, 0, 0);
     },
 
@@ -348,19 +581,30 @@ export default function (pi: ExtensionAPI) {
       const details = result.details as Record<string, unknown> | undefined;
       const count = (details?.count as number) ?? 0;
       const cached = details?.cached === true;
+      const estimatedTokens = details?.estimatedTokens as number | undefined;
+      const filters = details?.filters as Record<string, unknown> | undefined;
 
       let text = theme.fg("success", `${count} result${count !== 1 ? "s" : ""}`);
+      
+      if (estimatedTokens) {
+        text += theme.fg("dim", ` ~${estimatedTokens}tk`);
+      }
+      
+      if (filters?.diverse) {
+        text += theme.fg("dim", " [diverse]");
+      }
+      
       if (cached) {
         text += theme.fg("dim", " (cached)");
       }
 
       if (expanded && details?.results) {
-        const results = details.results as Array<{ title: string; url: string; description?: string }>;
+        const results = details.results as Array<{ title: string; url: string; description?: string; reliability?: string }>;
         for (const r of results.slice(0, 5)) {
           text += `\n${theme.fg("accent", r.title)}`;
           text += `\n${theme.fg("dim", r.url)}`;
-          if (r.description) {
-            text += `\n${theme.fg("muted", r.description)}`;
+          if (r.reliability === "authoritative") {
+            text += theme.fg("success", " ★");
           }
         }
       }
@@ -369,4 +613,3 @@ export default function (pi: ExtensionAPI) {
     },
   });
 }
-
