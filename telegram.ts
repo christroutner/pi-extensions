@@ -11,6 +11,9 @@ import { run, type RunnerHandle } from "@grammyjs/runner";
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN ?? "").trim();
 const ALLOWED_USER_ID = (process.env.TELEGRAM_ALLOWED_USER_ID ?? "").trim();
 
+// Telegram message length limit (4096 chars)
+const TELEGRAM_MAX_MESSAGE_LENGTH = 4000;
+
 // ============================================================================
 // State
 // ============================================================================
@@ -18,6 +21,7 @@ const ALLOWED_USER_ID = (process.env.TELEGRAM_ALLOWED_USER_ID ?? "").trim();
 let bot: Bot | null = null;
 let runner: RunnerHandle | null = null;
 let lastChatId: number | null = null;
+let pendingTelegramReply = false;
 
 // ============================================================================
 // Helpers
@@ -35,6 +39,81 @@ function isAllowedUser(userId: number | undefined): boolean {
 
 function isDirectMessage(chatType: string | undefined): boolean {
   return chatType === "private";
+}
+
+/**
+ * Extract text content from an agent message.
+ */
+function extractTextFromMessage(message: unknown): string {
+  if (!message || typeof message !== "object") {
+    return "";
+  }
+
+  const msg = message as { role?: string; content?: unknown };
+
+  // Only process assistant messages
+  if (msg.role !== "assistant") {
+    return "";
+  }
+
+  // Content can be an array of content blocks
+  if (!Array.isArray(msg.content)) {
+    return "";
+  }
+
+  const textParts: string[] = [];
+  for (const block of msg.content) {
+    if (block && typeof block === "object" && "type" in block) {
+      const typed = block as { type: string; text?: string };
+      if (typed.type === "text" && typeof typed.text === "string") {
+        textParts.push(typed.text);
+      }
+    }
+  }
+
+  return textParts.join("\n").trim();
+}
+
+/**
+ * Send a message to Telegram, splitting if necessary.
+ */
+async function sendToTelegram(text: string, chatId: number): Promise<void> {
+  if (!bot || !text) {
+    return;
+  }
+
+  // Split long messages
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= TELEGRAM_MAX_MESSAGE_LENGTH) {
+      chunks.push(remaining);
+      break;
+    }
+    // Find a good split point (newline or space)
+    let splitIdx = remaining.lastIndexOf("\n", TELEGRAM_MAX_MESSAGE_LENGTH);
+    if (splitIdx < TELEGRAM_MAX_MESSAGE_LENGTH / 2) {
+      splitIdx = remaining.lastIndexOf(" ", TELEGRAM_MAX_MESSAGE_LENGTH);
+    }
+    if (splitIdx < TELEGRAM_MAX_MESSAGE_LENGTH / 2) {
+      splitIdx = TELEGRAM_MAX_MESSAGE_LENGTH;
+    }
+    chunks.push(remaining.slice(0, splitIdx));
+    remaining = remaining.slice(splitIdx).trimStart();
+  }
+
+  for (const chunk of chunks) {
+    try {
+      await bot.api.sendMessage(chatId, chunk, { parse_mode: "Markdown" });
+    } catch {
+      // Retry without Markdown on parse errors
+      try {
+        await bot.api.sendMessage(chatId, chunk);
+      } catch (err) {
+        console.error(`[telegram] Failed to send message: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
 }
 
 // ============================================================================
@@ -89,8 +168,9 @@ export default function (pi: ExtensionAPI) {
           return;
         }
 
-        // Store chat ID for replies
+        // Store chat ID for replies and mark that we need to reply to Telegram
         lastChatId = msg.chat.id;
+        pendingTelegramReply = true;
 
         // Forward message to the agent
         pi.sendUserMessage(text.trim(), { deliverAs: "followUp" });
@@ -114,6 +194,38 @@ export default function (pi: ExtensionAPI) {
   });
 
   // -------------------------------------------------------------------------
+  // Agent End: Automatically broadcast response to Telegram
+  // -------------------------------------------------------------------------
+  pi.on("agent_end", async (event) => {
+    // Only send if we're expecting a Telegram reply
+    if (!pendingTelegramReply || !lastChatId || !bot) {
+      return;
+    }
+
+    // Reset the flag
+    pendingTelegramReply = false;
+
+    // Extract text from all assistant messages in this agent run
+    const messages = event.messages ?? [];
+    const textParts: string[] = [];
+
+    for (const msg of messages) {
+      const text = extractTextFromMessage(msg);
+      if (text) {
+        textParts.push(text);
+      }
+    }
+
+    const fullResponse = textParts.join("\n\n").trim();
+    if (!fullResponse) {
+      return;
+    }
+
+    // Send the response to Telegram
+    await sendToTelegram(fullResponse, lastChatId);
+  });
+
+  // -------------------------------------------------------------------------
   // Session Shutdown: Stop the bot
   // -------------------------------------------------------------------------
   pi.on("session_shutdown", async () => {
@@ -128,17 +240,18 @@ export default function (pi: ExtensionAPI) {
     }
     bot = null;
     lastChatId = null;
+    pendingTelegramReply = false;
     console.log("[telegram] Bot stopped");
   });
 
   // -------------------------------------------------------------------------
-  // Tool: telegram_reply
+  // Tool: telegram_reply (manual override)
   // -------------------------------------------------------------------------
   pi.registerTool({
     name: "telegram_reply",
     label: "Telegram Reply",
     description:
-      "Send a message back to the Telegram user. Use this to respond to messages received from Telegram.",
+      "Send an additional message to the Telegram user. The agent's response is automatically sent to Telegram, but use this tool if you need to send extra messages or formatted content.",
     parameters: Type.Object({
       message: Type.String({
         description: "The text message to send to the Telegram user.",
